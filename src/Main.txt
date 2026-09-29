@@ -1,0 +1,190 @@
+#include "ch32fun.h"
+
+/*
+===================================================================
+STEADY RAW SPEEDOMETER (2 KM/H COLD CUTOFF MODE)
+CH32V203F8U6 - 144MHz
+
+- 4 equally spaced spots = Every pulse interval is a quarter-turn (90 degrees).
+- FIX: Calibrated timeout window to 580ms. Tracks fluidly down to 2 km/h,
+  then drops instantly to 0 when the vehicle rolls to a stop.
+- Display smoothing remains active so values are perfectly scannable.
+===================================================================
+*/
+
+#define SENSOR_PIN 0   // A0 = PA0
+#define WHEEL_CIRCUMFERENCE_M 1.2566f // Dia 0.4m * PI
+
+// FIX: Extended from 400ms to 580ms (580ms * 144,000,000 cycles/sec = 83,520,000)
+// This lets the sensor capture slow pulses down to 2 km/h before resetting.
+#define TIMEOUT_CYCLE_THRESHOLD 82520000 
+
+volatile uint8_t last_state = 1;
+
+/* =========================================
+   USART2 INIT (72MHz APB1 Peripheral Clock)
+========================================= */
+void USART2_Init(uint32_t baudrate)
+{
+    RCC->APB2PCENR |= RCC_APB2Periph_GPIOA;
+    RCC->APB1PCENR |= RCC_APB1Periph_USART2;
+
+    GPIOA->CFGLR &= ~(0xF << (2 * 4));
+    GPIOA->CFGLR |=  (0xB << (2 * 4));
+
+    GPIOA->CFGLR &= ~(0xF << (3 * 4));
+    GPIOA->CFGLR |=  (0x4 << (3 * 4));
+
+    USART2->BRR = 0x0271; 
+    USART2->CTLR1 = USART_CTLR1_UE | USART_CTLR1_TE | USART_CTLR1_RE;
+}
+
+/* =========================================
+   PRINT ROUTINES
+========================================= */
+void print_string(const char *str)
+{
+    while (*str)
+    {
+        while (!(USART2->STATR & USART_STATR_TXE));
+        USART2->DATAR = *str++;
+    }
+}
+
+void print_int(int32_t num)
+{
+    char buf[12];
+    int i = 0;
+    if (num == 0) { print_string("0"); return; }
+    if (num < 0) { print_string("-"); num = -num; }
+    while (num > 0) { buf[i++] = (num % 10) + '0'; num /= 10; }
+    while (i > 0) { while (!(USART2->STATR & USART_STATR_TXE)); USART2->DATAR = buf[--i]; }
+}
+
+void print_float_2dp(float value)
+{
+    int32_t whole = (int32_t)value;
+    int32_t frac = (int32_t)((value - whole) * 100.0f);
+    if (frac < 0) frac = -frac;
+    print_int(whole);
+    print_string(".");
+    if (frac < 10) print_string("0");
+    print_int(frac);
+}
+
+/* =========================================
+   SENSOR GPIO INIT
+========================================= */
+void Sensor_Init(void)
+{
+    RCC->APB2PCENR |= RCC_APB2Periph_GPIOA;
+    GPIOA->CFGLR &= ~(0xF << (SENSOR_PIN * 4));
+    GPIOA->CFGLR |=  (0x4 << (SENSOR_PIN * 4)); 
+}
+
+/* =========================================
+   MAIN
+========================================= */
+int main(void)
+{
+    uint32_t final_rpm = 0;
+    float final_speed_kmph = 0.0f;
+    
+    float steady_speed_kmph = 0.0f;
+    uint32_t steady_rpm = 0;
+
+    SystemInit();
+    Delay_Ms(500);
+
+    SysTick->CTLR |= 0x04; 
+
+    USART2_Init(115200);
+    Sensor_Init();
+
+    print_string("\r\n--- SPEEDOMETER: CALIBRATED 2 KM/H COLD STOP ACTIVE ---\r\n");
+
+    uint64_t last_pulse_cycle = 0;
+    uint32_t tracked_quarter_turn_cycles = 0;
+    uint8_t system_has_started = 0;
+
+    while (1)
+    {
+        uint8_t current_state;
+        uint64_t current_cycle = SysTick->CNT;
+
+        /* Read raw pin input state */
+        current_state = (GPIOA->INDR & (1 << SENSOR_PIN)) ? 1 : 0;
+
+        // Falling edge detection
+        if ((last_state == 1) && (current_state == 0))
+        {
+            uint32_t cycles_elapsed = (uint32_t)(current_cycle - last_pulse_cycle);
+
+            if (system_has_started)
+            {
+                tracked_quarter_turn_cycles = cycles_elapsed;
+            }
+            else
+            {
+                system_has_started = 1;
+            }
+            last_pulse_cycle = current_cycle;
+        }
+        last_state = current_state;
+
+        // Calculate time currently passing since the last valid pulse
+        uint32_t silence_duration = (uint32_t)(current_cycle - last_pulse_cycle);
+
+        // Wipe the buffer to force immediate 0 once gap goes past 580ms limit
+        if (silence_duration > TIMEOUT_CYCLE_THRESHOLD)
+        {
+            tracked_quarter_turn_cycles = 0;
+            system_has_started = 0;
+        }
+
+        static uint32_t serial_timer = 0;
+        Delay_Ms(1); 
+        serial_timer += 1;
+
+        // Telemetry loop reporting every 200ms
+        if (serial_timer >= 200)
+        {
+            if (tracked_quarter_turn_cycles == 0)
+            {
+                final_rpm = 0;
+                final_speed_kmph = 0.0f;
+            }
+            else
+            {
+                float quarter_turn_seconds = (float)tracked_quarter_turn_cycles / 144000000.0f;
+
+                final_rpm = (uint32_t)(15.0f / quarter_turn_seconds);
+                final_speed_kmph = ((WHEEL_CIRCUMFERENCE_M * 0.25f) / quarter_turn_seconds) * 3.6f;
+            }
+
+            // Running Average Mix for smooth readability
+            if (final_speed_kmph == 0.0f)
+            {
+                steady_speed_kmph = 0.0f;
+                steady_rpm = 0;
+            }
+            else
+            {
+                steady_speed_kmph = (final_speed_kmph * 0.40f) + (steady_speed_kmph * 0.60f);
+                steady_rpm = (uint32_t)((float)final_rpm * 0.40f) + ((float)steady_rpm * 0.60f);
+            }
+
+            // Print stable display values
+            print_string("RPM: ");
+            print_int(steady_rpm);
+
+            print_string(" | Speed: ");
+            // Math rounding logic (+0.5f before truncation) to convert the float to an integer
+            int32_t rounded_speed = (int32_t)(steady_speed_kmph + 0.5f);
+            print_int(rounded_speed);
+            print_string(" km/h\r\n");
+
+            serial_timer = 0;
+        }
+    }
+}

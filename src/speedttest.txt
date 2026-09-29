@@ -1,0 +1,28 @@
+#include <stdio.h>
+#include "ch32fun.h"
+#include "uart.h"
+#include "speed.h"
+#include "clock.h"
+
+int main(void)
+{
+    char buffer[64];
+    Clock_init();
+
+    Uart_Init();
+    Speed_Init();
+
+    print_string("Speed Sensor Test\r\n");
+
+    while (1)
+    {
+        snprintf(buffer, sizeof(buffer),
+                 "Speed: %lu km/h | Freq: %lu Hz\r\n",
+                 Speed_getSpeed(),
+                 Speed_getFrequency());
+
+        print_string(buffer);
+
+        Delay_Ms(500);
+    }
+}
